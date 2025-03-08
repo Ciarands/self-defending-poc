@@ -1,79 +1,93 @@
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use std::{
+    env::args,
+    fmt::Write as _,
+    fs::read_to_string,
+    num::{NonZeroU64, NonZeroUsize},
+    ops::Range,
+    process::exit,
+    thread::available_parallelism,
+};
+
+use base64::{Engine as _, prelude::BASE64_STANDARD};
+use rayon::ThreadPoolBuilder;
 use sha2::{Digest, Sha256};
 
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use std::fmt::Write;
-use std::env;
-use std::fs;
+const TARGET: &str = "__TEMP__";
 
-const BATCH_SIZE: u64 = 1_000_000;
-
-fn rot47(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if ('!'..='~').contains(&c) {
-                let new_c = 33 + ((c as u8 - 33 + 47) % 94);
-                new_c as char
-            } else {
-                c
-            }
-        })
-        .collect()
+trait StringRot47Ext {
+    fn rot47(&mut self);
 }
 
-fn sha256(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    format!("{:x}", hasher.finalize())
+impl StringRot47Ext for String {
+    fn rot47(&mut self) {
+        // SAFETY: We only operate on ASCII, so the existing capacity is sufficient.
+        let bytes = unsafe { self.as_mut_vec() };
+        for b in bytes.iter_mut() {
+            if (b'!'..=b'~').contains(b) {
+                *b = 33 + ((*b - 33 + 47) % 94);
+            }
+        }
+    }
 }
 
 fn main() {
-    let check_length: usize = env::args()
+    let check_length: NonZeroU64 = args()
         .nth(1)
         .expect("Usage: program CHECK_LENGTH [START]")
         .parse()
         .expect("CHECK_LENGTH must be a number");
-    
-    let start = env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let payload = fs::read_to_string("input.txt").expect("Failed to read input.txt");
-    
-    let counter = Arc::new(AtomicU64::new(start));
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap() - 2;
 
-    let mut handles = Vec::with_capacity(num_workers);
-    for _ in 0..num_workers {
-        let counter = Arc::clone(&counter);
-        let payload = payload.clone();
-        handles.push(std::thread::spawn(move || worker(counter, check_length, &payload)));
-    }
+    let start: u64 = args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
 
-    for handle in handles {
-        handle.join().unwrap();
+    let payload = read_to_string("input.txt").expect("Failed to read input.txt");
+
+    let worker_count = (available_parallelism().map(NonZeroUsize::get).unwrap() - 2).max(1);
+    let iterations = start - (1 << (4 * check_length.get()));
+    let iterations_per_worker = iterations / worker_count as u64;
+    let remainder = iterations % worker_count as u64;
+
+    let workers = ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+        .unwrap();
+
+    let mut accumulator = start;
+    for worker_ix in 0..worker_count {
+        let workload = accumulator
+            ..(accumulator
+                + iterations_per_worker
+                + if u64::try_from(worker_ix).unwrap() < remainder {
+                    1
+                } else {
+                    0
+                });
+        accumulator = workload.end;
+
+        workers.install(|| brute_force(&payload, workload, check_length));
     }
 }
 
-fn worker(counter: Arc<AtomicU64>, check_length: usize, payload: &str) {
-    let mut str_i = String::with_capacity(check_length);
-    loop {
-        let start = counter.fetch_add(BATCH_SIZE, Ordering::Relaxed);
-        for i in start..start + BATCH_SIZE {
-            str_i.clear();
-            let _ = write!(&mut str_i, "{:0>width$x}", i, width = check_length);
-            let rot47_str = rot47(&str_i);
-            let base64_str = STANDARD.encode(&rot47_str);
-            let obfuscated_payload = payload.replace("__TEMP__", &format!("{}", base64_str));
-            // println!("{}", &obfuscated_payload[1..obfuscated_payload.len()-4]);
-            let hash = sha256(&obfuscated_payload[1..obfuscated_payload.len() - 4]);
+fn brute_force(payload: &str, workload: Range<u64>, check_length: NonZeroU64) {
+    let check_length = usize::try_from(check_length.get()).unwrap();
 
-            if hash.starts_with(&str_i) {
-                println!("Match found! Breaking loop...");
-                println!("{}", STANDARD.encode(&obfuscated_payload));
-                std::process::exit(0);
-            }
+    let mut number = String::with_capacity(check_length);
+    let mut hasher = Sha256::new();
+
+    for i in workload {
+        write!(&mut number, "{i:0>check_length$x}").unwrap();
+        number.rot47();
+        let base64 = BASE64_STANDARD.encode(&number);
+        let obfuscated = payload.replace(TARGET, &base64);
+        hasher.update(&obfuscated[1..obfuscated.len() - 4]);
+        let hash = format!("{:x}", hasher.finalize_reset());
+
+        if hash.starts_with(&number) {
+            println!("Match found: {}", BASE64_STANDARD.encode(&obfuscated));
+            exit(0);
         }
-        println!("Worker checked up to: {}\tLast checked: {}", start + BATCH_SIZE, str_i);
+        number.clear();
     }
 }
