@@ -1,0 +1,8 @@
+[package]
+name = "rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = "0.10.8"
+base64 = "0.22.1"
