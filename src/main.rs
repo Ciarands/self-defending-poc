@@ -83,6 +83,7 @@ fn brute_force(payload: &str, workload: Range<u64>, check_length: NonZeroU64) {
         let obfuscated = payload.replace(TARGET, &base64);
         hasher.update(&obfuscated[1..obfuscated.len() - 4]);
         let hash = format!("{:x}", hasher.finalize_reset());
+        number.rot47();
 
         if hash.starts_with(&number) {
             println!("Match found: {}", BASE64_STANDARD.encode(&obfuscated));
